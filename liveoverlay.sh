@@ -1,0 +1,493 @@
+#!/usr/bin/env bash
+#
+# LiveOverlay — one command to install and run the appliance on a Linux mini-PC.
+#
+#   ./liveoverlay.sh install     first-time setup: writes docker/.env, builds, starts,
+#                                enables start-on-boot, optionally sets up the TV kiosk
+#   ./liveoverlay.sh up          build (if needed) and start everything
+#   ./liveoverlay.sh down        stop everything
+#   ./liveoverlay.sh restart     down + up
+#   ./liveoverlay.sh status      container health + URLs
+#   ./liveoverlay.sh logs [svc]  follow logs (all services, or one: api-service, streamer, nginx…)
+#   ./liveoverlay.sh update      pull the new release (images + this bundle, or git) + restart
+#   ./liveoverlay.sh registry    pull prebuilt images from Docker Hub (see ./publish.sh)
+#   ./liveoverlay.sh backup      snapshot the database + media into ./backups/
+#   ./liveoverlay.sh kiosk       make the mini-PC open the player full-screen on login
+#   ./liveoverlay.sh cameras     list capture cards and switch HOST_VIDEO_DEVICE
+#   ./liveoverlay.sh license     set/change the license server URL + activation code
+#
+# Only Docker (with the compose plugin) is needed on the host. Everything else —
+# node, ffmpeg, nginx, mediamtx — runs in containers. The kiosk step uses the
+# desktop's Chromium/Chrome; on stock Ubuntu (Firefox only) it offers to snap-install
+# Chromium — a documented host exception, like the demo hotspot.
+
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+COMPOSE_FILE="$ROOT/docker/docker-compose.prod.yml"
+ENV_FILE="$ROOT/docker/.env"
+PLAYER_URL="http://localhost/"
+# Bundle install = unpacked from the <repo>:bundle-<tag> image by deploy/install-liveoverlay.sh:
+# no git checkout, no source — images always come from Docker Hub, `update` refreshes the bundle.
+BUNDLE=0; [ -d "$ROOT/.git" ] || BUNDLE=1
+
+bold() { printf '\033[1m%s\033[0m\n' "$*"; }
+ok()   { printf '\033[32m✔\033[0m %s\n' "$*"; }
+warn() { printf '\033[33m!\033[0m %s\n' "$*" >&2; }
+die()  { printf '\033[31m✘\033[0m %s\n' "$*" >&2; exit 1; }
+
+# Use sudo for docker only when the user isn't in the docker group yet.
+DOCKER=(docker)
+compose() { "${DOCKER[@]}" compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" "$@"; }
+
+need_docker() {
+  command -v docker >/dev/null 2>&1 || die "Docker is not installed. Install it with:
+    curl -fsSL https://get.docker.com | sudo sh
+  then re-run: ./liveoverlay.sh install"
+  if ! docker info >/dev/null 2>&1; then
+    if sudo -n true 2>/dev/null || [ -t 0 ]; then
+      sudo docker info >/dev/null 2>&1 || die "Docker is installed but not running: sudo systemctl start docker"
+      DOCKER=(sudo docker)
+      warn "Using sudo for docker. To drop it: sudo usermod -aG docker \$USER  (then log out/in)"
+    else
+      die "Cannot talk to Docker. Add yourself to the docker group: sudo usermod -aG docker \$USER"
+    fi
+  fi
+  "${DOCKER[@]}" compose version >/dev/null 2>&1 || die "The docker compose plugin is missing: sudo apt install docker-compose-plugin"
+}
+
+need_env() {
+  [ -f "$ENV_FILE" ] || die "docker/.env not found — run ./liveoverlay.sh install first."
+}
+
+lan_ip() { hostname -I 2>/dev/null | awk '{print $1}'; }
+
+# Prints one capture-card path per line (stable by-id links, capture node only).
+list_cameras() {
+  local d
+  for d in /dev/v4l/by-id/*-video-index0; do [ -e "$d" ] && echo "$d"; done
+  return 0
+}
+
+pick_camera() {
+  local cams=() c i choice
+  while IFS= read -r c; do cams+=("$c"); done < <(list_cameras)
+  if [ "${#cams[@]}" -eq 0 ]; then
+    warn "No USB capture card found under /dev/v4l/by-id/. Plug it in and press Enter,"
+    read -r -p "  or type a device path (e.g. /dev/video0): " choice
+    if [ -z "$choice" ]; then
+      cams=(); while IFS= read -r c; do cams+=("$c"); done < <(list_cameras)
+      [ "${#cams[@]}" -gt 0 ] || die "Still no capture card detected."
+    else
+      [ -e "$choice" ] || die "$choice does not exist."
+      SELECTED_CAMERA="$choice"; return
+    fi
+  fi
+  if [ "${#cams[@]}" -eq 1 ]; then
+    SELECTED_CAMERA="${cams[0]}"
+  else
+    echo "Capture cards found:"
+    for i in "${!cams[@]}"; do echo "  $((i+1))) ${cams[$i]}"; done
+    read -r -p "Which one? [1]: " choice
+    choice="${choice:-1}"
+    [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#cams[@]}" ] || die "Invalid choice."
+    SELECTED_CAMERA="${cams[$((choice-1))]}"
+  fi
+  ok "Capture card: $SELECTED_CAMERA"
+}
+
+# Ask for the cloud license server (required — the device is watermarked without it).
+prompt_license() {
+  local url code re="^https://[^[:space:]'\"]+$"
+  bold "Licensing"
+  while :; do
+    read -r -p "  License server URL (e.g. https://license.yourdomain): " url
+    [[ "$url" =~ $re ]] && break
+    warn "Must be an https:// URL (devices talk to it over mutual TLS)."
+  done
+  read -r -p "  Activation code (optional — Enter to wait for manual approval instead): " code
+  [[ "$code" != *"'"* ]] || die "Activation code can't contain a single quote."
+  set_env LICENSE_SERVER_URL "${url%/}"
+  set_env LICENSE_ACTIVATION_CODE "$code"
+  ok "License server: ${url%/}"
+}
+
+env_has() { grep -Eq "^$1='?[^']" "$ENV_FILE" 2>/dev/null; }
+
+# Set KEY='value' in docker/.env (single-quoted = literal, no $ interpolation by compose).
+set_env() {
+  local key="$1" val="$2" tmp
+  tmp="$(mktemp)"
+  grep -v "^${key}=" "$ENV_FILE" > "$tmp" || true
+  printf "%s='%s'\n" "$key" "$val" >> "$tmp"
+  cat "$tmp" > "$ENV_FILE"; rm -f "$tmp"
+}
+
+write_env() {
+  local email pw pw2 secret
+  bold "Admin account (you log in to the dashboard with this)"
+  read -r -p "  Email [admin@liveoverlay.local]: " email
+  email="${email:-admin@liveoverlay.local}"
+  while :; do
+    read -r -s -p "  Password (min 10 chars): " pw; echo
+    [ "${#pw}" -ge 10 ] || { warn "Too short."; continue; }
+    [[ "$pw" != *"'"* ]] || { warn "Please don't use a single quote (') in the password."; continue; }
+    read -r -s -p "  Repeat password: " pw2; echo
+    [ "$pw" = "$pw2" ] && break
+    warn "Passwords don't match."
+  done
+
+  pick_camera
+
+  # A database copied along with the repo already has a user, so the admin typed
+  # above would never be seeded (the api seeds only an empty users table).
+  local old=() f yn
+  for f in "$ROOT"/config/liveoverlay.db* "$ROOT/config/license.enc"; do [ -e "$f" ] && old+=("$f"); done
+  if [ "${#old[@]}" -gt 0 ]; then
+    warn "config/ already holds a database (copied with the repo?). Its users would override the admin above."
+    read -r -p "  Move it aside to backups/ so a fresh database is created? [Y/n]: " yn || yn=y
+    if [[ ! "${yn:-y}" =~ ^[Nn] ]]; then
+      local dest; dest="$ROOT/backups/pre-install-$(date +%Y%m%d-%H%M%S)"
+      mkdir -p "$dest"
+      for f in "${old[@]}"; do
+        mv "$f" "$dest/" 2>/dev/null || sudo mv "$f" "$dest/" || die "Could not move $f"
+      done
+      ok "Old database moved to $dest"
+    fi
+  fi
+
+  if command -v openssl >/dev/null 2>&1; then
+    secret="$(openssl rand -base64 48 | tr -d '\n')"
+  else
+    secret="$(head -c 48 /dev/urandom | base64 | tr -d '\n')"
+  fi
+
+  umask 077
+  : > "$ENV_FILE"
+  set_env JWT_SECRET "$secret"
+  set_env ADMIN_EMAIL "$email"
+  set_env ADMIN_PASSWORD "$pw"
+  set_env HOST_VIDEO_DEVICE "$SELECTED_CAMERA"
+  prompt_license
+  if [ -n "${LO_BOOT_REPO:-}" ]; then
+    # Handed over by deploy/install-liveoverlay.sh, which already ran docker login.
+    set_env LIVEOVERLAY_IMAGE_REPO "$LO_BOOT_REPO"
+    set_env LIVEOVERLAY_TAG "${LO_BOOT_TAG:-latest}"
+  else
+    prompt_registry
+  fi
+  chmod 600 "$ENV_FILE"
+  ok "Wrote docker/.env (readable only by you). More settings: docker/.env.example"
+}
+
+# Registry mode = LIVEOVERLAY_IMAGE_REPO set in docker/.env: the api/dashboard/streamer
+# images are pulled from Docker Hub (published with ./publish.sh) instead of built here.
+registry_mode() { env_has LIVEOVERLAY_IMAGE_REPO; }
+
+cmd_up() {
+  need_docker; need_env
+  mkdir -p "$ROOT/media" "$ROOT/config"
+  [ "$BUNDLE" = 0 ] || registry_mode || die "No image repository set (a bundle install can't build). Run: ./liveoverlay.sh registry"
+  if registry_mode; then
+    # Pull only what's missing, so a restart works offline; `update` pulls new versions.
+    bold "Starting LiveOverlay (prebuilt images from Docker Hub)…"
+    compose up -d --no-build --pull missing --remove-orphans \
+      || die "Could not start. Image missing on Docker Hub, or not logged in? Run: ./liveoverlay.sh registry"
+  else
+    bold "Building and starting LiveOverlay (first build takes a few minutes)…"
+    compose up --build -d --remove-orphans
+  fi
+  wait_healthy
+  cmd_urls
+}
+
+prompt_registry() {
+  local repo tag
+  bold "Prebuilt images (Docker Hub)"
+  echo "  Pull the images published with ./publish.sh instead of building them here."
+  [ "$BUNDLE" = 1 ] || echo "  Leave empty to build locally on this mini-PC."
+  read -r -p "  Repository (<user>/liveoverlay) [${LIVEOVERLAY_IMAGE_REPO_CUR:-none}]: " repo
+  repo="${repo:-${LIVEOVERLAY_IMAGE_REPO_CUR:-}}"
+  if [ -z "$repo" ] || [ "$repo" = none ]; then
+    [ "$BUNDLE" = 0 ] || die "This install has no source code to build from — a repository is required."
+    set_env LIVEOVERLAY_IMAGE_REPO ""; set_env LIVEOVERLAY_TAG ""
+    ok "Images will be built locally."; return 0
+  fi
+  [[ "$repo" =~ ^[a-z0-9][a-z0-9._-]*/[a-z0-9][a-z0-9._/-]*$ ]] || die "Must look like <user>/liveoverlay (lowercase)."
+  read -r -p "  Tag to run (latest, or a pinned version like v1.4.0) [latest]: " tag
+  tag="${tag:-latest}"
+  [[ "$tag" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]*$ ]] || die "Invalid tag: $tag"
+  echo "  The repository is private: log in with a Docker Hub access token (Read-only scope is enough)."
+  "${DOCKER[@]}" login || die "docker login failed."
+  set_env LIVEOVERLAY_IMAGE_REPO "$repo"
+  set_env LIVEOVERLAY_TAG "$tag"
+  ok "Images: $repo:<service>-$tag"
+}
+
+cmd_registry() {
+  need_docker; need_env
+  LIVEOVERLAY_IMAGE_REPO_CUR="$(grep -E "^LIVEOVERLAY_IMAGE_REPO=" "$ENV_FILE" | cut -d"'" -f2 || true)"
+  prompt_registry
+  ok "Apply it with: ./liveoverlay.sh update"
+}
+
+wait_healthy() {
+  local i unhealthy
+  printf 'Waiting for services to become healthy'
+  for i in $(seq 1 60); do
+    unhealthy="$("${DOCKER[@]}" ps --filter "name=liveoverlay-" --format '{{.Names}} {{.Status}}' \
+      | grep -E 'starting|unhealthy|Restarting' || true)"
+    [ -z "$unhealthy" ] && { echo; ok "All services healthy."; return 0; }
+    printf '.'; sleep 3
+  done
+  echo; warn "Some services are not healthy yet:"; echo "$unhealthy"
+  warn "Check with: ./liveoverlay.sh logs"
+}
+
+cmd_urls() {
+  local ip; ip="$(lan_ip)"
+  echo
+  bold "LiveOverlay is running"
+  echo "  TV / player (on this mini-PC):  $PLAYER_URL"
+  echo "  Dashboard:                      http://localhost/dashboard/"
+  [ -n "$ip" ] && echo "  Dashboard from another device:  http://$ip/dashboard/"
+  echo
+}
+
+cmd_down()   { need_docker; need_env; compose down; }
+cmd_status() {
+  need_docker; need_env; compose ps; cmd_urls
+  local lic
+  lic="$( { wget -qO- http://127.0.0.1/api/license/status || curl -fs http://127.0.0.1/api/license/status; } 2>/dev/null     | grep -o '"state":"[a-z]*"' | cut -d'"' -f4 || true)"
+  case "$lic" in
+    active)  ok "License: active" ;;
+    grace)   warn "License: grace period (can't reach the license server — check internet)" ;;
+    "")      warn "License: unknown (api not reachable)" ;;
+    *)       warn "License: $lic — the TV shows the unlicensed watermark. Approve this device in the license admin, or run ./liveoverlay.sh license" ;;
+  esac
+}
+
+cmd_license() {
+  need_env
+  prompt_license
+  ok "Apply it with: ./liveoverlay.sh restart"
+}
+cmd_logs()   { need_docker; need_env; compose logs -f --tail=200 "$@"; }
+
+env_get() { grep -E "^$1=" "$ENV_FILE" 2>/dev/null | tail -1 | cut -d= -f2- | sed "s/^'//; s/'$//"; }
+
+# Replace the compose file + scripts with the ones from <repo>:bundle-<tag>. Each file is
+# renamed into place (same filesystem → atomic, new inode), so this very script — which
+# bash is still reading — is never modified under it. docker/.env, config/, media/ untouched.
+refresh_bundle() {
+  local img tmp f
+  img="$(env_get LIVEOVERLAY_IMAGE_REPO):bundle-$(env_get LIVEOVERLAY_TAG)"
+  "${DOCKER[@]}" pull -q "$img" >/dev/null || die "Could not pull $img (not logged in? tag not published?). Nothing was restarted."
+  tmp="$(mktemp -d "$ROOT/.bundle.XXXXXX")"
+  "${DOCKER[@]}" run --rm "$img" | tar -xf - -C "$tmp" || { rm -rf "$tmp"; die "Could not unpack $img."; }
+  (cd "$tmp" && find . -type f) | while IFS= read -r f; do
+    mkdir -p "$ROOT/$(dirname "$f")"; mv -f "$tmp/$f" "$ROOT/$f"
+  done
+  rm -rf "$tmp"
+  ok "Updated compose file + scripts from $img"
+}
+
+cmd_update() {
+  need_docker; need_env
+  if [ "$BUNDLE" = 1 ]; then
+    registry_mode || die "No image repository set. Run: ./liveoverlay.sh registry"
+    bold "Pulling the release…"
+    refresh_bundle
+  else
+    git -C "$ROOT" pull --ff-only || die "git pull failed (local changes?). Nothing was restarted."
+  fi
+  if registry_mode; then
+    bold "Pulling images…"
+    compose pull || die "docker pull failed (not logged in? tag not published?). Nothing was restarted. See: ./liveoverlay.sh registry"
+  fi
+  cmd_up
+  "${DOCKER[@]}" image prune -f >/dev/null || true
+}
+
+cmd_backup() {
+  need_docker; need_env
+  local dir="$ROOT/backups" file
+  file="$dir/liveoverlay-$(date +%Y%m%d-%H%M%S).tar.gz"
+  mkdir -p "$dir"
+  # Stop the api for a few seconds so the SQLite file (WAL mode) is consistent on disk.
+  # The api container runs as root, so config/ holds root-only files (license.enc 0600).
+  local tarc=(tar)
+  [ -z "$(find "$ROOT/config" "$ROOT/media" ! -readable -print -quit 2>/dev/null)" ] || tarc=(sudo tar)
+  compose stop api-service >/dev/null
+  "${tarc[@]}" -C "$ROOT" -czf "$file" config media docker/.env || { compose start api-service >/dev/null; die "Backup failed."; }
+  compose start api-service >/dev/null
+  [ "${tarc[0]}" = tar ] || sudo chown "$(id -u):$(id -g)" "$file"
+  chmod 600 "$file"
+  ok "Backup written: $file"
+  echo "  Restore: ./liveoverlay.sh down && sudo tar -C \"$ROOT\" -xzf \"$file\" && ./liveoverlay.sh up"
+}
+
+cmd_cameras() {
+  need_env
+  pick_camera
+  set_env HOST_VIDEO_DEVICE "$SELECTED_CAMERA"
+  ok "Saved. Apply it with: ./liveoverlay.sh restart"
+}
+
+cmd_kiosk() {
+  local browser="" b yn autostart="$HOME/.config/autostart"
+  # Box provisioned by scripts/provision-appliance.sh: Openbox already opens the player.
+  # Its getty autologin marker is world-readable (the kiosk user's home is not).
+  if grep -qs "$PLAYER_URL" "$HOME/.config/openbox/autostart" \
+     || [ -f /etc/systemd/system/getty@tty1.service.d/autologin.conf ]; then
+    ok "Kiosk already set up by provision-appliance.sh (Openbox autostart)."
+    return 0
+  fi
+  # No desktop at all (e.g. Ubuntu Server): nothing to autostart a browser in.
+  if [ -z "${DISPLAY:-}${WAYLAND_DISPLAY:-}${XDG_CURRENT_DESKTOP:-}" ] \
+     && ! systemctl is-enabled --quiet display-manager 2>/dev/null \
+     && [ ! -e /etc/X11/default-display-manager ]; then
+    warn "No desktop/display manager on this machine, so the TV would only show a text console."
+    warn "Set up the TV kiosk with: sudo bash ./scripts/provision-appliance.sh   (then reboot)"
+    return 1
+  fi
+  for b in chromium chromium-browser google-chrome google-chrome-stable; do
+    command -v "$b" >/dev/null 2>&1 && { browser="$b"; break; }
+  done
+  # Stock Ubuntu Desktop ships only Firefox. A kiosk browser is a documented host
+  # exception (like the demo hotspot) — nothing else is installed on the host.
+  if [ -z "$browser" ] && command -v snap >/dev/null 2>&1; then
+    read -r -p "  No Chromium/Chrome found. Install Chromium for the TV kiosk? [Y/n]: " yn || yn=n
+    if [[ ! "${yn:-y}" =~ ^[Nn] ]] && sudo snap install chromium; then
+      browser="$(command -v chromium || echo /snap/bin/chromium)"
+    fi
+  fi
+  if [ -z "$browser" ]; then
+    for b in firefox firefox-esr; do
+      command -v "$b" >/dev/null 2>&1 && { browser="$b"; break; }
+    done
+    [ -z "$browser" ] || warn "Using $browser for the kiosk (Chromium is recommended: videos with sound may not autoplay)."
+  fi
+  if [ -z "$browser" ]; then
+    warn "No browser found. Install Chromium ('sudo snap install chromium' or your distro's"
+    warn "package), then run: ./liveoverlay.sh kiosk"
+    return 1
+  fi
+  local flags="--kiosk --noerrdialogs --disable-infobars --no-first-run --disable-translate \
+  --disable-session-crashed-bubble --autoplay-policy=no-user-gesture-required --password-store=basic"
+  case "$(basename "$browser")" in firefox*) flags="--kiosk" ;; esac
+  local launcher="$HOME/.local/bin/liveoverlay-kiosk"
+  mkdir -p "$autostart" "$(dirname "$launcher")"
+  cat > "$launcher" <<EOF
+#!/bin/sh
+# Written by liveoverlay.sh kiosk. Waits for the stack, then opens the player full-screen.
+# Keep the TV from blanking/locking (GNOME) at every login — liveoverlay.sh's own
+# gsettings calls no-op when it runs over SSH (no D-Bus session bus).
+if command -v gsettings >/dev/null 2>&1; then
+  gsettings set org.gnome.desktop.session idle-delay 0 2>/dev/null
+  gsettings set org.gnome.desktop.screensaver lock-enabled false 2>/dev/null
+  gsettings set org.gnome.settings-daemon.plugins.power sleep-inactive-ac-type 'nothing' 2>/dev/null
+fi
+i=0
+while [ \$i -lt 60 ]; do
+  { wget -q -O /dev/null $PLAYER_URL || curl -fs -o /dev/null $PLAYER_URL; } 2>/dev/null && break
+  i=\$((i+1)); sleep 2
+done
+exec $browser $flags $PLAYER_URL
+EOF
+  chmod +x "$launcher"
+  cat > "$autostart/liveoverlay-kiosk.desktop" <<EOF
+[Desktop Entry]
+Type=Application
+Name=LiveOverlay Kiosk
+Comment=Full-screen LiveOverlay player on the TV output
+Exec=$launcher
+X-GNOME-Autostart-enabled=true
+EOF
+  # Keep the TV from blanking (GNOME). Harmless no-op elsewhere.
+  if command -v gsettings >/dev/null 2>&1; then
+    gsettings set org.gnome.desktop.session idle-delay 0 2>/dev/null || true
+    gsettings set org.gnome.desktop.screensaver lock-enabled false 2>/dev/null || true
+    gsettings set org.gnome.settings-daemon.plugins.power sleep-inactive-ac-type 'nothing' 2>/dev/null || true
+  fi
+  ok "Kiosk set: $browser opens $PLAYER_URL full-screen at login."
+  kiosk_autologin
+  echo "  Exit the kiosk with Alt+F4. Remove it: rm $autostart/liveoverlay-kiosk.desktop $launcher"
+  # Open it now too (not only at next login) when we're inside the desktop session.
+  # ./prod sets LO_KIOSK_LAUNCH=0 and opens it itself after the smoke test.
+  if [ "${LO_KIOSK_LAUNCH:-1}" != 0 ] && [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] \
+     && ! pgrep -f "$PLAYER_URL" >/dev/null 2>&1; then
+    nohup "$launcher" >/dev/null 2>&1 &
+  fi
+}
+
+# The autostart entry only runs once this user is logged in — make the box log in
+# by itself after a reboot so the TV shows the player, not the login screen.
+kiosk_autologin() {
+  local f="" yn
+  for f in /etc/gdm3/custom.conf /etc/gdm3/daemon.conf ""; do [ -z "$f" ] || [ -f "$f" ] && break; done
+  if [ -z "$f" ] || [ "$(id -u)" -eq 0 ]; then
+    echo "  For a hands-off box, enable automatic login for this user in Settings → Users."
+    return 0
+  fi
+  if grep -q "^AutomaticLoginEnable=true" "$f" && grep -q "^AutomaticLogin=$USER\$" "$f"; then
+    ok "Automatic login already enabled for $USER."; return 0
+  fi
+  read -r -p "  Log in $USER automatically at boot (so the TV shows the player after a reboot)? [Y/n]: " yn || yn=n
+  [[ ! "${yn:-y}" =~ ^[Nn] ]] || { echo "  Skipped — the TV shows the login screen after a reboot until someone logs in."; return 0; }
+  if sudo sed -i '/^[[:space:]#]*AutomaticLogin/d' "$f" \
+     && if grep -q '^\[daemon\]' "$f"; then
+          sudo sed -i -e "/^\[daemon\]/a AutomaticLogin=$USER" -e '/^\[daemon\]/a AutomaticLoginEnable=true' "$f"
+        else
+          printf '[daemon]\nAutomaticLoginEnable=true\nAutomaticLogin=%s\n' "$USER" | sudo tee -a "$f" >/dev/null
+        fi; then
+    ok "Automatic login enabled for $USER ($f)."
+  else
+    warn "Could not edit $f — enable automatic login in Settings → Users."
+  fi
+}
+
+cmd_install() {
+  [ "$(uname -s)" = "Linux" ] || die "The appliance runs on Linux. (For development on Windows/macOS use: pnpm dev)"
+  need_docker
+  if [ -f "$ENV_FILE" ]; then
+    ok "docker/.env already exists — keeping it. (Delete it to re-run the questions.)"
+    env_has LICENSE_SERVER_URL || prompt_license
+  else
+    write_env
+  fi
+  # Containers use restart: unless-stopped, so they come back on boot once Docker does.
+  if command -v systemctl >/dev/null 2>&1; then
+    { systemctl is-enabled --quiet docker 2>/dev/null || sudo systemctl enable --now docker >/dev/null 2>&1; } && ok "Docker starts on boot (LiveOverlay follows)." \
+      || warn "Could not enable docker on boot: sudo systemctl enable docker"
+  fi
+  cmd_up
+  local yn
+  read -r -p "Open the player full-screen on this mini-PC's screen at login (TV kiosk)? [Y/n]: " yn || yn=n
+  if [[ "${yn:-y}" =~ ^[Nn] ]]; then
+    set_env KIOSK off   # remembered, so ./prod doesn't ask again
+  else
+    cmd_kiosk || true
+  fi
+  echo
+  bold "Done. Log in to the dashboard with your admin email, then change the password in Settings."
+}
+
+usage() { sed -n '3,22p' "$0" | sed 's/^# \{0,1\}//'; }
+
+case "${1:-}" in
+  install) cmd_install ;;
+  up|start) cmd_up ;;
+  down|stop) cmd_down ;;
+  restart) cmd_down; cmd_up ;;
+  status|ps) cmd_status ;;
+  logs) shift; cmd_logs "$@" ;;
+  update) cmd_update ;;
+  backup) cmd_backup ;;
+  kiosk) cmd_kiosk ;;
+  cameras) cmd_cameras ;;
+  license) cmd_license ;;
+  registry) cmd_registry ;;
+  ""|-h|--help|help) usage ;;
+  *) usage; exit 1 ;;
+esac
