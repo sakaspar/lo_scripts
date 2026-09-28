@@ -2,7 +2,13 @@
 #
 # LiveOverlay — one command to install and run the appliance on a Linux mini-PC.
 #
-#   ./liveoverlay.sh install     first-time setup: writes docker/.env, builds, starts,
+# Needs NO source code: copy just this file onto a fresh mini-PC and run
+#   bash liveoverlay.sh install
+# It installs Docker, logs in to the private Docker Hub repo, unpacks the release bundle
+# (compose file + scripts) next to itself — or into ~/liveoverlay when it sits directly in
+# your home folder — and runs the setup. Images are pulled, never built.
+#
+#   ./liveoverlay.sh install     first-time setup: writes docker/.env, builds/pulls, starts,
 #                                enables start-on-boot, optionally sets up the TV kiosk
 #   ./liveoverlay.sh up          build (if needed) and start everything
 #   ./liveoverlay.sh down        stop everything
@@ -27,9 +33,13 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 COMPOSE_FILE="$ROOT/docker/docker-compose.prod.yml"
 ENV_FILE="$ROOT/docker/.env"
 PLAYER_URL="http://localhost/"
-# Bundle install = unpacked from the <repo>:bundle-<tag> image by deploy/install-liveoverlay.sh:
+DEFAULT_REPO="ksp0/lo"
+# Bundle install = unpacked from the <repo>:bundle-<tag> image (see bootstrap below):
 # no git checkout, no source — images always come from Docker Hub, `update` refreshes the bundle.
 BUNDLE=0; [ -d "$ROOT/.git" ] || BUNDLE=1
+# The build: sections live in a separate file that only a source checkout has.
+COMPOSE_FILES=(-f "$COMPOSE_FILE")
+[ ! -f "$ROOT/docker/docker-compose.prod.build.yml" ] || COMPOSE_FILES+=(-f "$ROOT/docker/docker-compose.prod.build.yml")
 
 bold() { printf '\033[1m%s\033[0m\n' "$*"; }
 ok()   { printf '\033[32m✔\033[0m %s\n' "$*"; }
@@ -38,7 +48,7 @@ die()  { printf '\033[31m✘\033[0m %s\n' "$*" >&2; exit 1; }
 
 # Use sudo for docker only when the user isn't in the docker group yet.
 DOCKER=(docker)
-compose() { "${DOCKER[@]}" compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" "$@"; }
+compose() { "${DOCKER[@]}" compose --env-file "$ENV_FILE" "${COMPOSE_FILES[@]}" "$@"; }
 
 need_docker() {
   command -v docker >/dev/null 2>&1 || die "Docker is not installed. Install it with:
@@ -60,7 +70,7 @@ need_env() {
   [ -f "$ENV_FILE" ] || die "docker/.env not found — run ./liveoverlay.sh install first."
 }
 
-lan_ip() { hostname -I 2>/dev/null | awk '{print $1}'; }
+lan_ip() { hostname -I 2>/dev/null | awk '{print $1}' || true; }
 
 # Prints one capture-card path per line (stable by-id links, capture node only).
 list_cameras() {
@@ -96,23 +106,33 @@ pick_camera() {
   ok "Capture card: $SELECTED_CAMERA"
 }
 
-# Ask for the cloud license server (required — the device is watermarked without it).
+# Ask for the cloud license server. Empty = licensing OFF (LICENSE_MODE=off) — a
+# TEMPORARY workaround while no license server is deployed; remove before go-live.
 prompt_license() {
   local url code re="^https://[^[:space:]'\"]+$"
   bold "Licensing"
+  echo "  No license server yet? Leave it empty: licensing is turned OFF for now (no watermark)."
   while :; do
-    read -r -p "  License server URL (e.g. https://license.yourdomain): " url
+    read -r -p "  License server URL (e.g. https://license.yourdomain) [none]: " url
+    if [ -z "$url" ]; then
+      set_env LICENSE_SERVER_URL ""; set_env LICENSE_ACTIVATION_CODE ""; set_env LICENSE_MODE off
+      warn "Licensing OFF (temporary). Turn it on later with: ./liveoverlay.sh license"
+      return 0
+    fi
     [[ "$url" =~ $re ]] && break
-    warn "Must be an https:// URL (devices talk to it over mutual TLS)."
+    warn "Must be an https:// URL (devices talk to it over mutual TLS), or empty."
   done
   read -r -p "  Activation code (optional — Enter to wait for manual approval instead): " code
   [[ "$code" != *"'"* ]] || die "Activation code can't contain a single quote."
   set_env LICENSE_SERVER_URL "${url%/}"
   set_env LICENSE_ACTIVATION_CODE "$code"
+  set_env LICENSE_MODE ""
   ok "License server: ${url%/}"
 }
 
 env_has() { grep -Eq "^$1='?[^']" "$ENV_FILE" 2>/dev/null; }
+license_off() { grep -q "^LICENSE_MODE='off'" "$ENV_FILE" 2>/dev/null; }
+license_configured() { env_has LICENSE_SERVER_URL || license_off; }
 
 # Set KEY='value' in docker/.env (single-quoted = literal, no $ interpolation by compose).
 set_env() {
@@ -163,6 +183,7 @@ write_env() {
   fi
 
   umask 077
+  mkdir -p "$(dirname "$ENV_FILE")"
   : > "$ENV_FILE"
   set_env JWT_SECRET "$secret"
   set_env ADMIN_EMAIL "$email"
@@ -170,7 +191,7 @@ write_env() {
   set_env HOST_VIDEO_DEVICE "$SELECTED_CAMERA"
   prompt_license
   if [ -n "${LO_BOOT_REPO:-}" ]; then
-    # Handed over by deploy/install-liveoverlay.sh, which already ran docker login.
+    # Handed over by bootstrap (standalone first run), which already ran docker login.
     set_env LIVEOVERLAY_IMAGE_REPO "$LO_BOOT_REPO"
     set_env LIVEOVERLAY_TAG "${LO_BOOT_TAG:-latest}"
   else
@@ -260,7 +281,8 @@ cmd_status() {
   local lic
   lic="$( { wget -qO- http://127.0.0.1/api/license/status || curl -fs http://127.0.0.1/api/license/status; } 2>/dev/null     | grep -o '"state":"[a-z]*"' | cut -d'"' -f4 || true)"
   case "$lic" in
-    active)  ok "License: active" ;;
+    active)  if license_off; then warn "License: OFF (temporary LICENSE_MODE=off — no license server yet)"
+             else ok "License: active"; fi ;;
     grace)   warn "License: grace period (can't reach the license server — check internet)" ;;
     "")      warn "License: unknown (api not reachable)" ;;
     *)       warn "License: $lic — the TV shows the unlicensed watermark. Approve this device in the license admin, or run ./liveoverlay.sh license" ;;
@@ -276,20 +298,88 @@ cmd_logs()   { need_docker; need_env; compose logs -f --tail=200 "$@"; }
 
 env_get() { grep -E "^$1=" "$ENV_FILE" 2>/dev/null | tail -1 | cut -d= -f2- | sed "s/^'//; s/'$//"; }
 
-# Replace the compose file + scripts with the ones from <repo>:bundle-<tag>. Each file is
-# renamed into place (same filesystem → atomic, new inode), so this very script — which
+# Unpack an already-pulled <repo>:bundle-<tag> (compose file + scripts) into $2. Each file
+# is renamed into place (same filesystem → atomic, new inode), so this very script — which
 # bash is still reading — is never modified under it. docker/.env, config/, media/ untouched.
-refresh_bundle() {
-  local img tmp f
-  img="$(env_get LIVEOVERLAY_IMAGE_REPO):bundle-$(env_get LIVEOVERLAY_TAG)"
-  "${DOCKER[@]}" pull -q "$img" >/dev/null || die "Could not pull $img (not logged in? tag not published?). Nothing was restarted."
-  tmp="$(mktemp -d "$ROOT/.bundle.XXXXXX")"
+unpack_bundle() {
+  local img="$1" dir="$2" tmp f
+  mkdir -p "$dir"
+  tmp="$(mktemp -d "$dir/.bundle.XXXXXX")"
   "${DOCKER[@]}" run --rm "$img" | tar -xf - -C "$tmp" || { rm -rf "$tmp"; die "Could not unpack $img."; }
   (cd "$tmp" && find . -type f) | while IFS= read -r f; do
-    mkdir -p "$ROOT/$(dirname "$f")"; mv -f "$tmp/$f" "$ROOT/$f"
+    mkdir -p "$dir/$(dirname "$f")"; mv -f "$tmp/$f" "$dir/$f"
   done
   rm -rf "$tmp"
+}
+
+refresh_bundle() {
+  local img
+  img="$(env_get LIVEOVERLAY_IMAGE_REPO):bundle-$(env_get LIVEOVERLAY_TAG)"
+  "${DOCKER[@]}" pull -q "$img" >/dev/null || die "Could not pull $img (not logged in? tag not published?). Nothing was restarted."
+  unpack_bundle "$img" "$ROOT"
   ok "Updated compose file + scripts from $img"
+}
+
+# Standalone = this script was copied alone onto the mini-PC (no compose file next to it):
+# install Docker, log in to Docker Hub, unpack the release bundle, then run ./prod from it.
+# Re-running on an installed box is harmless (docker/.env is kept).
+bootstrap() {
+  local dir="$ROOT" repo tag r t img self
+  local sudo=(); [ "$(id -u)" -eq 0 ] || sudo=(sudo)
+  [ "$(uname -s)" = Linux ] || die "The appliance runs on a Linux mini-PC. (For development on Windows/macOS use: pnpm dev)"
+  case "$(uname -m)" in x86_64|amd64) ;; *) die "The images are built for x86_64; this machine is $(uname -m)." ;; esac
+  [ -t 0 ] || die "Run it in a terminal — it asks questions (over SSH: ssh -t)."
+  # Never spill docker/, scripts/, prod… straight into the home folder.
+  [ "$ROOT" != "$HOME" ] || dir="$HOME/liveoverlay"
+  bold "No release files next to this script — installing LiveOverlay from Docker Hub into $dir"
+
+  if ! command -v docker >/dev/null 2>&1; then
+    bold "Installing Docker Engine (the only thing installed on this machine)"
+    command -v curl >/dev/null 2>&1 || { "${sudo[@]}" apt-get update && "${sudo[@]}" apt-get install -y curl; } \
+      || die "curl is missing and could not be installed."
+    curl -fsSL https://get.docker.com | "${sudo[@]}" sh || die "Docker install failed — see https://docs.docker.com/engine/install/"
+  fi
+  if command -v systemctl >/dev/null 2>&1; then
+    "${sudo[@]}" systemctl enable --now docker >/dev/null 2>&1 || warn "Could not enable the docker service on boot."
+  fi
+  # Continue as a docker-group member, so the Hub login lands in THIS user's ~/.docker
+  # (where every later ./liveoverlay.sh update looks), not root's.
+  if ! docker info >/dev/null 2>&1; then
+    [ "$(id -u)" -ne 0 ] || die "Docker is installed but not running: systemctl start docker"
+    id -nG | tr ' ' '\n' | grep -qx docker || { "${sudo[@]}" usermod -aG docker "$USER" && ok "Added $USER to the docker group."; }
+    command -v sg >/dev/null 2>&1 || die "Log out and back in (docker group), then re-run: bash $0 install"
+    [ -z "${LO_REEXEC:-}" ] || die "Still can't talk to Docker. Log out and back in, then re-run: bash $0 install"
+    self="$ROOT/$(basename "${BASH_SOURCE[0]}")"
+    exec sg docker -c "LO_REEXEC=1 bash $(printf '%q ' "$self" "$@")" </dev/tty
+  fi
+  docker compose version >/dev/null 2>&1 || die "The docker compose plugin is missing: sudo apt-get install docker-compose-plugin"
+  ok "Docker $(docker version --format '{{.Server.Version}}' 2>/dev/null) with compose $(docker compose version --short)"
+
+  repo="${LIVEOVERLAY_IMAGE_REPO:-}"; tag="${LIVEOVERLAY_TAG:-}"
+  if [ -z "$repo" ]; then read -r -p "Docker Hub repository [$DEFAULT_REPO]: " r; repo="${r:-$DEFAULT_REPO}"; fi
+  if [ -z "$tag" ]; then read -r -p "Release to run (latest, or a version like v1.2.0) [latest]: " t; tag="${t:-latest}"; fi
+  [[ "$repo" =~ ^[a-z0-9][a-z0-9._-]*/[a-z0-9][a-z0-9._/-]*$ ]] || die "Repository must look like <user>/<name>, got: $repo"
+  [[ "$tag" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]*$ ]] || die "Invalid release tag: $tag"
+
+  img="$repo:bundle-$tag"
+  if ! docker pull -q "$img" >/dev/null 2>&1; then
+    bold "Docker Hub login (the repository is private)"
+    echo "  Username = the Docker Hub account; password = an access token with READ-ONLY scope"
+    echo "  (hub.docker.com → Account settings → Personal access tokens)."
+    docker login || die "docker login failed."
+    docker pull -q "$img" >/dev/null || die "Could not pull $img — is release '$tag' published (./publish.sh)?"
+  fi
+  unpack_bundle "$img" "$dir"
+  ok "Release $img unpacked into $dir"
+  [ "$dir" = "$ROOT" ] || echo "  From now on: cd $dir && ./liveoverlay.sh status | update | logs | backup"
+
+  # Re-run on an installed box: switch release if asked, keep every other setting.
+  if [ -f "$dir/docker/.env" ]; then
+    sed -i -e "/^LIVEOVERLAY_IMAGE_REPO=/d" -e "/^LIVEOVERLAY_TAG=/d" "$dir/docker/.env"
+    printf "LIVEOVERLAY_IMAGE_REPO='%s'\nLIVEOVERLAY_TAG='%s'\n" "$repo" "$tag" >> "$dir/docker/.env"
+  fi
+  cd "$dir"
+  LO_BOOT_REPO="$repo" LO_BOOT_TAG="$tag" exec ./prod
 }
 
 cmd_update() {
@@ -452,7 +542,7 @@ cmd_install() {
   need_docker
   if [ -f "$ENV_FILE" ]; then
     ok "docker/.env already exists — keeping it. (Delete it to re-run the questions.)"
-    env_has LICENSE_SERVER_URL || prompt_license
+    license_configured || prompt_license
   else
     write_env
   fi
@@ -473,7 +563,13 @@ cmd_install() {
   bold "Done. Log in to the dashboard with your admin email, then change the password in Settings."
 }
 
-usage() { sed -n '3,22p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '3,28p' "$0" | sed 's/^# \{0,1\}//'; }
+
+# Copied alone onto the machine: fetch the release first, whatever command was asked.
+if [ ! -f "$COMPOSE_FILE" ]; then
+  case "${1:-}" in -h|--help|help) usage; exit 0 ;; esac
+  bootstrap "$@"
+fi
 
 case "${1:-}" in
   install) cmd_install ;;
