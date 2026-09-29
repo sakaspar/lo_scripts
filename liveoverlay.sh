@@ -46,9 +46,33 @@ ok()   { printf '\033[32m✔\033[0m %s\n' "$*"; }
 warn() { printf '\033[33m!\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[31m✘\033[0m %s\n' "$*" >&2; exit 1; }
 
+is_wsl() { [ -n "${WSL_DISTRO_NAME:-}" ] || grep -qi microsoft /proc/sys/kernel/osrelease 2>/dev/null; }
+
+# HOST_VIDEO_DEVICE='none' = no capture card (e.g. WSL, or a box without the card yet):
+# everything runs except the streamer, which only exists to read the card.
+NOCAPTURE_FILE="$ROOT/docker/docker-compose.nocapture.yml"
+no_capture() { grep -q "^HOST_VIDEO_DEVICE='none'" "$ENV_FILE" 2>/dev/null; }
+
 # Use sudo for docker only when the user isn't in the docker group yet.
 DOCKER=(docker)
-compose() { "${DOCKER[@]}" compose --env-file "$ENV_FILE" "${COMPOSE_FILES[@]}" "$@"; }
+compose() {
+  local files=("${COMPOSE_FILES[@]}")
+  if no_capture; then
+    # Generated here (not shipped in the bundle) so it works with any published release.
+    printf '# Written by liveoverlay.sh: no capture card, so the streamer is not started.\nservices:\n  streamer:\n    profiles: ["capture"]\n' > "$NOCAPTURE_FILE"
+    files+=(-f "$NOCAPTURE_FILE")
+  fi
+  "${DOCKER[@]}" compose --env-file "$ENV_FILE" "${files[@]}" "$@"
+}
+
+# Start the docker daemon: systemd when it is PID 1, else the SysV wrapper (WSL without systemd).
+start_docker_daemon() {
+  if [ -d /run/systemd/system ]; then
+    sudo systemctl enable --now docker >/dev/null 2>&1
+  else
+    sudo service docker start >/dev/null 2>&1
+  fi
+}
 
 need_docker() {
   command -v docker >/dev/null 2>&1 || die "Docker is not installed. Install it with:
@@ -56,7 +80,8 @@ need_docker() {
   then re-run: ./liveoverlay.sh install"
   if ! docker info >/dev/null 2>&1; then
     if sudo -n true 2>/dev/null || [ -t 0 ]; then
-      sudo docker info >/dev/null 2>&1 || die "Docker is installed but not running: sudo systemctl start docker"
+      sudo docker info >/dev/null 2>&1 || { start_docker_daemon; sleep 2; sudo docker info >/dev/null 2>&1; } \
+        || die "Docker is installed but not running: sudo systemctl start docker  (WSL without systemd: sudo service docker start)"
       DOCKER=(sudo docker)
       warn "Using sudo for docker. To drop it: sudo usermod -aG docker \$USER  (then log out/in)"
     else
@@ -64,6 +89,12 @@ need_docker() {
     fi
   fi
   "${DOCKER[@]}" compose version >/dev/null 2>&1 || die "The docker compose plugin is missing: sudo apt install docker-compose-plugin"
+  # nginx/mediamtx/streamer use network_mode: host. Under Docker Desktop that is the
+  # Desktop VM's network, not this machine's, unless host networking is turned on.
+  if is_wsl && "${DOCKER[@]}" info --format '{{.OperatingSystem}}' 2>/dev/null | grep -qi 'docker desktop'; then
+    warn "Docker Desktop detected. Turn on Settings → Resources → Network → 'Enable host networking'"
+    warn "(Docker Desktop 4.34+), or http://localhost will not reach LiveOverlay."
+  fi
 }
 
 need_env() {
@@ -82,17 +113,25 @@ list_cameras() {
 pick_camera() {
   local cams=() c i choice
   while IFS= read -r c; do cams+=("$c"); done < <(list_cameras)
-  if [ "${#cams[@]}" -eq 0 ]; then
-    warn "No USB capture card found under /dev/v4l/by-id/. Plug it in and press Enter,"
-    read -r -p "  or type a device path (e.g. /dev/video0): " choice
-    if [ -z "$choice" ]; then
-      cams=(); while IFS= read -r c; do cams+=("$c"); done < <(list_cameras)
-      [ "${#cams[@]}" -gt 0 ] || die "Still no capture card detected."
-    else
-      [ -e "$choice" ] || die "$choice does not exist."
-      SELECTED_CAMERA="$choice"; return
+  while [ "${#cams[@]}" -eq 0 ]; do
+    warn "No USB capture card found under /dev/v4l/by-id/."
+    if is_wsl; then
+      warn "This is WSL: USB devices are not visible unless attached from Windows with usbipd-win"
+      warn "(https://learn.microsoft.com/windows/wsl/connect-usb). Everything else works without it."
     fi
-  fi
+    echo "  Plug it in and press Enter to rescan, type a device path (e.g. /dev/video0),"
+    read -r -p "  or type 'none' to run without live HDMI input for now: " choice
+    case "$choice" in
+      "") cams=(); while IFS= read -r c; do cams+=("$c"); done < <(list_cameras) ;;
+      none|skip)
+        SELECTED_CAMERA=none
+        warn "No capture card: everything runs except the live HDMI stream. Add one later: ./liveoverlay.sh cameras"
+        return ;;
+      *)
+        if [ -c "$choice" ]; then SELECTED_CAMERA="$choice"; ok "Capture card: $SELECTED_CAMERA"; return; fi
+        warn "$choice is not a video device (ls /dev/video* /dev/v4l/by-id/)." ;;
+    esac
+  done
   if [ "${#cams[@]}" -eq 1 ]; then
     SELECTED_CAMERA="${cams[0]}"
   else
@@ -209,6 +248,11 @@ cmd_up() {
   need_docker; need_env
   mkdir -p "$ROOT/media" "$ROOT/config"
   [ "$BUNDLE" = 0 ] || registry_mode || die "No image repository set (a bundle install can't build). Run: ./liveoverlay.sh registry"
+  if no_capture; then
+    # A streamer left over from when a card was configured would keep crash-looping.
+    "${DOCKER[@]}" rm -f liveoverlay-streamer >/dev/null 2>&1 || true
+    warn "No capture card configured — starting without the live HDMI stream (./liveoverlay.sh cameras to add one)."
+  fi
   if registry_mode; then
     # Pull only what's missing, so a restart works offline; `update` pulls new versions.
     bold "Starting LiveOverlay (prebuilt images from Docker Hub)…"
@@ -271,7 +315,12 @@ cmd_urls() {
   bold "LiveOverlay is running"
   echo "  TV / player (on this mini-PC):  $PLAYER_URL"
   echo "  Dashboard:                      http://localhost/dashboard/"
-  [ -n "$ip" ] && echo "  Dashboard from another device:  http://$ip/dashboard/"
+  if is_wsl; then
+    echo "  (WSL: open these in your Windows browser. Other devices on the LAN need WSL mirrored"
+    echo "   networking — networkingMode=mirrored in %UserProfile%\\.wslconfig — or a port proxy.)"
+  elif [ -n "$ip" ]; then
+    echo "  Dashboard from another device:  http://$ip/dashboard/"
+  fi
   echo
 }
 
@@ -339,8 +388,12 @@ bootstrap() {
       || die "curl is missing and could not be installed."
     curl -fsSL https://get.docker.com | "${sudo[@]}" sh || die "Docker install failed — see https://docs.docker.com/engine/install/"
   fi
-  if command -v systemctl >/dev/null 2>&1; then
+  if [ -d /run/systemd/system ]; then
     "${sudo[@]}" systemctl enable --now docker >/dev/null 2>&1 || warn "Could not enable the docker service on boot."
+  elif ! docker info >/dev/null 2>&1 && ! "${sudo[@]}" docker info >/dev/null 2>&1; then
+    # WSL without systemd: no unit manager, start the daemon via its init script.
+    "${sudo[@]}" service docker start >/dev/null 2>&1 || warn "Could not start docker (sudo service docker start)."
+    ! is_wsl || warn "WSL without systemd: docker won't start by itself. Add [boot] systemd=true to /etc/wsl.conf, then: wsl --shutdown"
   fi
   # Continue as a docker-group member, so the Hub login lands in THIS user's ~/.docker
   # (where every later ./liveoverlay.sh update looks), not root's.
@@ -540,6 +593,14 @@ kiosk_autologin() {
 cmd_install() {
   [ "$(uname -s)" = "Linux" ] || die "The appliance runs on Linux. (For development on Windows/macOS use: pnpm dev)"
   need_docker
+  # The api bind-mounts /etc/machine-id (license fingerprint). WSL without systemd may lack
+  # it, and docker would then create an empty directory in its place.
+  if [ ! -s /etc/machine-id ]; then
+    { command -v systemd-machine-id-setup >/dev/null 2>&1 && sudo systemd-machine-id-setup >/dev/null 2>&1; } \
+      || tr -d '-' < /proc/sys/kernel/random/uuid | sudo tee /etc/machine-id >/dev/null \
+      || die "/etc/machine-id is missing and could not be created."
+    ok "Created /etc/machine-id"
+  fi
   if [ -f "$ENV_FILE" ]; then
     ok "docker/.env already exists — keeping it. (Delete it to re-run the questions.)"
     license_configured || prompt_license
@@ -547,17 +608,25 @@ cmd_install() {
     write_env
   fi
   # Containers use restart: unless-stopped, so they come back on boot once Docker does.
-  if command -v systemctl >/dev/null 2>&1; then
+  if [ -d /run/systemd/system ]; then
     { systemctl is-enabled --quiet docker 2>/dev/null || sudo systemctl enable --now docker >/dev/null 2>&1; } && ok "Docker starts on boot (LiveOverlay follows)." \
       || warn "Could not enable docker on boot: sudo systemctl enable docker"
+  elif is_wsl; then
+    warn "WSL without systemd: after 'wsl --shutdown' run: sudo service docker start && ./liveoverlay.sh up"
   fi
   cmd_up
-  local yn
-  read -r -p "Open the player full-screen on this mini-PC's screen at login (TV kiosk)? [Y/n]: " yn || yn=n
-  if [[ "${yn:-y}" =~ ^[Nn] ]]; then
-    set_env KIOSK off   # remembered, so ./prod doesn't ask again
+  local yn=y
+  if is_wsl; then
+    # No TV output / login session to autostart in: the Windows browser is the player.
+    set_env KIOSK off
+    echo "WSL: no TV kiosk — open http://localhost/ (player) and http://localhost/dashboard/ in a Windows browser."
   else
-    cmd_kiosk || true
+    read -r -p "Open the player full-screen on this mini-PC's screen at login (TV kiosk)? [Y/n]: " yn || yn=n
+    if [[ "${yn:-y}" =~ ^[Nn] ]]; then
+      set_env KIOSK off   # remembered, so ./prod doesn't ask again
+    else
+      cmd_kiosk || true
+    fi
   fi
   echo
   bold "Done. Log in to the dashboard with your admin email, then change the password in Settings."
