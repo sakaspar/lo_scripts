@@ -33,6 +33,7 @@ LiveOverlay appliance — sudo ./liveoverlay.sh <command>
   timezone [Zone/City]              device time zone (schedules)
   registry [--rotate]               image repository/tag + this customer's read-only token
   license            set/change the license server URL + activation code (required; verified)
+  password           forgotten dashboard password: set a new one (logs out every phone/browser)
 EOF
 }
 
@@ -385,6 +386,58 @@ cmd_license() {
   prompt_license
   compose up -d --no-build --pull never api-service >/dev/null || die "Could not restart the api (sudo ./liveoverlay.sh up)."
   ensure_license || die "The license is not active — the TV shows the unlicensed watermark. Retry: sudo ./liveoverlay.sh license"
+}
+
+# Forgotten dashboard password: set a new one from the box itself (root on the mini-PC is the
+# trust boundary — whoever has it owns the device anyway). Writes the bcrypt hash straight into
+# the users row (data, not schema), revokes every admin session, then restarts the api because
+# live sessions are cached in its memory. LO_ADMIN_PASSWORD skips the prompt.
+cmd_password() {
+  need_docker; need_env
+  docker ps --format '{{.Names}}' | grep -qx liveoverlay-api || die "The api is not running: sudo ./liveoverlay.sh up"
+  local pw="${LO_ADMIN_PASSWORD:-}" pw2 email hash
+  email="$(env_get ADMIN_EMAIL)"
+  if [ -z "$pw" ]; then
+    interactive || die "No terminal to ask: set LO_ADMIN_PASSWORD."
+    bold "New dashboard password${email:+ for $email}"
+    while :; do
+      read -r -s -p "  Password (min 10 chars): " pw; echo
+      [ "${#pw}" -ge 10 ] || { warn "Too short."; continue; }
+      [[ "$pw" != *"'"* ]] || { warn "Please don't use a single quote (')."; continue; }
+      read -r -s -p "  Repeat password: " pw2; echo
+      [ "$pw" = "$pw2" ] && break
+      warn "Passwords don't match."
+    done
+  fi
+  [ "${#pw}" -ge 10 ] || die "The password must be at least 10 characters."
+  [[ "$pw" != *"'"* ]] || die "The password cannot contain a single quote (')."
+  local out
+  out="$(LO_PW="$pw" LO_EMAIL="$email" docker exec -i -e LO_PW -e LO_EMAIL liveoverlay-api node - <<'JS'
+const Database = require('better-sqlite3');
+const bcrypt = require('bcryptjs');
+const db = new Database(process.env.DB_PATH, { fileMustExist: true });
+const users = db.prepare('SELECT id, email FROM users').all();
+const want = (process.env.LO_EMAIL || '').toLowerCase();
+const user = users.find((u) => u.email.toLowerCase() === want) || (users.length === 1 ? users[0] : null);
+if (!user) { console.error('no unique admin user (found ' + users.length + ')'); process.exit(1); }
+const hash = bcrypt.hashSync(process.env.LO_PW, 10);
+db.transaction(() => {
+  db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(hash, user.id);
+  db.prepare("UPDATE sessions SET revoked_at = datetime('now') WHERE user_id = ? AND revoked_at IS NULL").run(user.id);
+})();
+process.stdout.write(user.email + '\n' + hash);
+JS
+)" || die "Could not set the password (sudo ./liveoverlay.sh logs api-service)."
+  email="$(printf '%s' "$out" | head -1)"; hash="$(printf '%s' "$out" | tail -1)"
+  # Keep the reseed value in step (only used if the database is ever recreated).
+  if [[ "$hash" =~ ^\$2[aby]\$[0-9]{2}\$.{53}$ ]] && env_has ADMIN_PASSWORD_HASH; then set_env ADMIN_PASSWORD_HASH "$hash"; fi
+  set_env ADMIN_PASSWORD ""
+  docker restart liveoverlay-api >/dev/null || die "Could not restart the api."
+  wait_healthy 90 >/dev/null 2>&1 || warn "The api is slow to come back — check: sudo ./liveoverlay.sh status"
+  ok "Dashboard password changed for $email. Every signed-in phone/browser was logged out;"
+  local ip; ip="$(lan_ip)"
+  echo "  the TV kiosk keeps working (it uses its own kiosk token)."
+  echo "  Log in: https://liveoverlay.local/dashboard/${ip:+   or https://$ip/dashboard/}   (on this machine: http://localhost/dashboard/)"
 }
 
 # The license server must never share a machine with the app (licence.sh refuses the reverse).
@@ -1087,6 +1140,7 @@ case "$cmd" in
   timezone) cmd_timezone "${1:-}" ;;
   registry) cmd_registry "${1:-}" ;;
   license) cmd_license ;;
+  password|reset-password) cmd_password ;;
   install-docker) cmd_install_docker ;;
   *) usage; exit 1 ;;
 esac
