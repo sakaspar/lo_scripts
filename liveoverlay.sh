@@ -4,11 +4,11 @@
 #
 # Needs NO source code: copy just this file onto a fresh mini-PC and run
 #   bash liveoverlay.sh install
-# It installs Docker (signed apt repo), logs in to the private Docker Hub repo with this
-# customer's read-only token, unpacks the release bundle (compose file + scripts) next to
-# itself — or into ~/liveoverlay when it sits directly in your home folder — and runs the
-# setup. Images are pulled, never built. Everything runs as root (it re-runs itself with sudo):
-# docker/.env, the registry token and the backups are root-only.
+# It installs Docker (signed apt repo), pulls the release bundle (compose file + scripts) from
+# Docker Hub — ksp0/lo is PUBLIC, no login; a private repo asks for a read-only token —, unpacks
+# it next to itself — or into ~/liveoverlay when it sits directly in your home folder — and runs
+# the setup. Images are pulled, never built. Everything runs as root (it re-runs itself with
+# sudo): docker/.env, any registry token and the backups are root-only.
 set -euo pipefail
 
 usage() {
@@ -31,7 +31,7 @@ LiveOverlay appliance — sudo ./liveoverlay.sh <command>
   demo up|down|status               isolated demo hotspot, new passphrase each session
   harden             power-cut settings (journald, fsck, docker live-restore)
   timezone [Zone/City]              device time zone (schedules)
-  registry [--rotate]               image repository/tag + this customer's read-only token
+  registry [--rotate]               image repository/tag (+ read-only token if the repo is private)
   license            set/change the license server URL + activation code (required; verified)
   password           forgotten dashboard password: set a new one (logs out every phone/browser)
 EOF
@@ -448,15 +448,43 @@ guard_no_license_stack() {
   fi
 }
 
-# ── Registry: this customer's read-only Docker Hub token (Q45 / N9) ──────────
-# One access token per customer (Read-only scope), rotated at every release (publish.sh prints
-# the checklist). Stored by `docker login` in root's ~/.docker/config.json (0600) — never in
-# docker/.env, never readable by the kiosk or admin user.
+# ── Registry access (Q45 / N9) ───────────────────────────────────────────────
+# ksp0/lo is PUBLIC (owner choice, 2026-10-01): devices pull anonymously and keep NO Docker Hub
+# credentials — a stored token the owner later revokes makes Docker Hub refuse even anonymous
+# pulls ("unauthorized"), so a public repo drops it. A PRIVATE repo still works with one
+# read-only token per customer, stored by `docker login` in root's ~/.docker/config.json (0600)
+# — never in docker/.env, never readable by the kiosk or admin user.
+
+# Unauthenticated Hub API: 200 = public. 404 (private or missing), offline, no curl = not known public.
+hub_repo_public() { # hub_repo_public <repo>
+  command -v curl >/dev/null 2>&1 || return 1
+  [ "$(curl -s -o /dev/null --max-time 10 -w '%{http_code}' "https://hub.docker.com/v2/repositories/$1/" 2>/dev/null || true)" = 200 ]
+}
+
+drop_hub_login() {
+  if grep -q 'index.docker.io' /root/.docker/config.json 2>/dev/null; then
+    docker logout >/dev/null 2>&1 || true
+    ok "Removed this device's Docker Hub token (a public repo needs none) — you can revoke it on Docker Hub."
+  fi
+  [ ! -f "$ENV_FILE" ] || del_env REGISTRY_TOKEN_SET_AT
+}
+
+registry_access() { # registry_access <repo>: public → no credentials; private → read-only token
+  if hub_repo_public "$1"; then
+    ok "$1 is public on Docker Hub — no login needed."
+    drop_hub_login
+  else
+    echo "  $1 is private (or Docker Hub could not be reached to tell)."
+    registry_login "$1"
+  fi
+}
+
 registry_login() { # registry_login <repo>
   local user token
   echo "  Docker Hub login for this device: the Hub account name + THIS customer's access token"
   echo "  (hub.docker.com → Account settings → Personal access tokens → scope: Read-only)."
-  read -r -p "  Docker Hub user: " user
+  read -r -p "  Docker Hub user (empty = no login, the repo is public): " user
+  [ -n "$user" ] || { warn "No Docker Hub login — pulls only work if $1 is public."; return 0; }
   [[ "$user" =~ ^[a-z0-9][a-z0-9._-]*$ ]] || die "Invalid Docker Hub user name."
   read -r -s -p "  Access token (read-only): " token; echo
   [ -n "$token" ] || die "Empty token."
@@ -483,7 +511,7 @@ prompt_registry() {
   read -r -p "  Release [${cur:-latest}]: " tag
   tag="${tag:-${cur:-latest}}"
   [[ "$tag" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]*$ ]] || die "Invalid tag: $tag"
-  registry_login "$repo"
+  registry_access "$repo"
   set_env LIVEOVERLAY_IMAGE_REPO "$repo"
   set_env LIVEOVERLAY_TAG "$tag"
   ok "Images: $repo:<service>-$tag"
@@ -494,8 +522,10 @@ cmd_registry() {
   if [ "${1:-}" = --rotate ]; then
     bold "Rotating this device's registry token"
     registry_mode || die "No repository configured. Run: sudo ./liveoverlay.sh registry"
-    registry_login "$(env_get LIVEOVERLAY_IMAGE_REPO)"
-    docker pull -q "$(env_get LIVEOVERLAY_IMAGE_REPO):bundle-$(env_get LIVEOVERLAY_TAG)" >/dev/null \
+    local repo; repo="$(env_get LIVEOVERLAY_IMAGE_REPO)"
+    if hub_repo_public "$repo"; then ok "$repo is public — no token to rotate."; drop_hub_login; return 0; fi
+    registry_login "$repo"
+    docker pull -q "$repo:bundle-$(env_get LIVEOVERLAY_TAG)" >/dev/null \
       && ok "New token works (release bundle pulled). Now REVOKE the old token on Docker Hub." \
       || die "The new token cannot pull this release — check its scope/repository."
     return 0
@@ -716,8 +746,12 @@ bootstrap() {
 
   img="$repo:bundle-$tag"
   if ! docker pull -q "$img" >/dev/null 2>&1; then
-    bold "Docker Hub login (the repository is private)"
-    registry_login "$repo"
+    if hub_repo_public "$repo"; then
+      drop_hub_login   # a stale (revoked) stored token makes Docker Hub refuse even public pulls
+    else
+      bold "Docker Hub login (the repository is private)"
+      registry_login "$repo"
+    fi
     docker pull -q "$img" >/dev/null || die "Could not pull $img — is release '$tag' published (./publish.sh)?"
   fi
   local stage; stage="$(mktemp -d)"
@@ -845,6 +879,8 @@ cmd_update() { # cmd_update [version]
   record_release
   pre_update_backup
   [ -z "$target" ] || { set_env LIVEOVERLAY_TAG "$target"; ok "Target release: $target"; }
+  # Public repo: pull anonymously — an old customer token, once revoked, would block the pull.
+  if registry_mode && hub_repo_public "$(env_get LIVEOVERLAY_IMAGE_REPO)"; then drop_hub_login; fi
   if [ "$BUNDLE" = 1 ]; then
     registry_mode || die "No image repository set. Run: sudo ./liveoverlay.sh registry"
     local img; img="$(env_get LIVEOVERLAY_IMAGE_REPO):bundle-$(env_get LIVEOVERLAY_TAG)"
@@ -854,7 +890,7 @@ cmd_update() { # cmd_update [version]
     unpack_bundle_to "$img" "$stage"
     bold "Pulling the release's images…"
     docker compose --env-file "$ENV_FILE" -f "$stage/docker/docker-compose.prod.yml" --profile mdns pull \
-      || { rm -rf "$stage"; set_env LIVEOVERLAY_TAG "$(cat "$RB_DIR/tag")"; die "Image pull failed. Nothing was changed. (sudo ./liveoverlay.sh registry --rotate if the token expired)"; }
+      || { rm -rf "$stage"; set_env LIVEOVERLAY_TAG "$(cat "$RB_DIR/tag")"; die "Image pull failed. Nothing was changed. (Private repo: sudo ./liveoverlay.sh registry --rotate if the token expired)"; }
     install_staged "$stage"; rm -rf "$stage"
     ok "Release files updated."
   else
@@ -1055,7 +1091,7 @@ write_env() {
   prompt_timezone
   prompt_license
   if [ -n "${LO_BOOT_REPO:-}" ]; then
-    # Handed over by bootstrap (standalone first run), which already ran docker login.
+    # Handed over by bootstrap (standalone first run), which already pulled from the repo.
     set_env LIVEOVERLAY_IMAGE_REPO "$LO_BOOT_REPO"
     set_env LIVEOVERLAY_TAG "${LO_BOOT_TAG:-latest}"
   else
