@@ -28,7 +28,6 @@ LiveOverlay appliance — sudo ./liveoverlay.sh <command>
   cameras            list capture cards; choose the one the kiosk opens
   certs [--renew]    show / regenerate the HTTPS certificate (liveoverlay.local + LAN IPs)
   firewall [apply|remove|status]    host firewall (80/443 + SSH from the LAN only)
-  demo up|down|status               isolated demo hotspot, new passphrase each session
   harden             power-cut settings (journald, fsck, docker live-restore)
   timezone [Zone/City]              device time zone (schedules)
   registry [--rotate]               image repository/tag (+ read-only token if the repo is private)
@@ -181,6 +180,32 @@ migrate_env() {
   return 0
 }
 
+# The demo phone and its Wi-Fi hotspot were removed (2026-10). A hotspot an older release
+# started stays up until the next reboot (its profile never autoconnects): take it down, then its
+# nftables isolation table, and drop the retired script + its passphrase file. Runs from `up`,
+# `update` and `firewall apply` — the update that DELIVERS this still executes the old script.
+demo_hotspot_profile() { command -v nmcli >/dev/null 2>&1 && nmcli -t -f NAME connection show 2>/dev/null | grep -x liveoverlay-demo-hotspot >/dev/null; }
+retire_demo_hotspot() {
+  if demo_hotspot_profile; then
+    nmcli connection down liveoverlay-demo-hotspot >/dev/null 2>&1 || true
+    nmcli connection delete liveoverlay-demo-hotspot >/dev/null 2>&1 || true
+    if demo_hotspot_profile; then
+      # Keep its isolation table: without it the hotspot's guests would reach the LAN side.
+      warn "Could not remove the old demo Wi-Fi hotspot. Remove it: sudo nmcli connection delete liveoverlay-demo-hotspot"
+      return 0
+    fi
+    ok "Old demo Wi-Fi hotspot removed."
+  fi
+  if command -v nft >/dev/null 2>&1; then
+    nft delete table inet liveoverlay_hotspot 2>/dev/null || true
+    if nft list table inet liveoverlay 2>/dev/null | grep 'demo hotspot' >/dev/null; then
+      warn "The firewall still opens the old hotspot DHCP/DNS ports. Close them: sudo ./liveoverlay.sh firewall apply"
+    fi
+  fi
+  rm -f "$ROOT/scripts/demo-hotspot.sh" /run/liveoverlay-hotspot.env
+  return 0
+}
+
 lan_ip() { hostname -I 2>/dev/null | awk '{print $1}' || true; }
 
 # ── Capture cards (the kiosk opens them with getUserMedia, Q10) ──────────────
@@ -288,9 +313,10 @@ cmd_timezone() {
 }
 
 # ── Licensing (required) ────────────────────────────────────────────────────
-# The license server runs on ANOTHER machine (licence.sh — the owner's laptop/server), reached
-# over the internet. `./licence.sh url` prints the URL, `./licence.sh code` an activation code.
+# The license server runs on ANOTHER machine (licence.sh — the owner's Azure VM), reached over
+# the internet. `./licence.sh url` prints the URL, `./licence.sh code` an activation code.
 # Install verifies both: the api enrolls with the code and must then validate over mutual TLS.
+DEFAULT_LICENSE_URL="https://liveoverlay.duckdns.org"
 LICENSE_URL_RE='^https://[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?(:[0-9]{1,5})?$'
 LICENSE_CODE_RE='^[A-Za-z0-9][A-Za-z0-9-]{3,63}$'
 
@@ -305,13 +331,14 @@ probe_license_server() { # probe_license_server <url> → 0 reachable
 }
 
 prompt_license() {
-  local url code yn
+  local url code yn cur
   bold "Licensing (required)"
   echo "  From the license server operator: its URL (./licence.sh url) and an activation code for"
   echo "  this mini-PC (./licence.sh code)."
+  cur="$(env_get LICENSE_SERVER_URL)"; cur="${cur:-$DEFAULT_LICENSE_URL}"
   while :; do
-    read -r -p "  License server URL [$(env_get LICENSE_SERVER_URL)]: " url
-    url="${url:-$(env_get LICENSE_SERVER_URL)}"; url="${url%/}"
+    read -r -p "  License server URL [$cur]: " url
+    url="${url:-$cur}"; url="${url%/}"
     [[ "$url" =~ $LICENSE_URL_RE ]] || { warn "Must look like https://license.example.com (optionally :port)."; continue; }
     probe_license_server "$url" && break
     read -r -p "  Keep this URL anyway? [y/N]: " yn || yn=n
@@ -383,9 +410,25 @@ ensure_license() {
 
 cmd_license() {
   need_docker; need_env
+  local before reset=n yn
+  before="$(env_get LICENSE_SERVER_URL)"
   prompt_license
+  # The device pins the license server's CA and holds a client cert from it (config/license.enc).
+  # Against a NEW or reinstalled server (new CA) it would only ever fail with `certificate` — it
+  # has to forget that and enroll again with the new activation code.
+  if [ -f "$ROOT/config/license.enc" ]; then
+    [ "$(env_get LICENSE_SERVER_URL)" = "$before" ] || reset=y
+    read -r -p "  New or reinstalled license server? Forget this device's stored license and enroll again [$([ "$reset" = y ] && echo Y/n || echo y/N)]: " yn || yn=""
+    case "${yn:-$reset}" in [Yy]*) reset=y ;; *) reset=n ;; esac
+  fi
+  if [ "$reset" = y ]; then
+    compose stop api-service >/dev/null 2>&1 || true   # or it writes the old cache back
+    mkdir -p "$ROOT/backups"
+    mv -f "$ROOT/config/license.enc" "$ROOT/backups/license.enc.$(date +%Y%m%d-%H%M%S)"
+    ok "Old license moved to backups/ — this device enrolls again with the new code."
+  fi
   compose up -d --no-build --pull never api-service >/dev/null || die "Could not restart the api (sudo ./liveoverlay.sh up)."
-  ensure_license || die "The license is not active — the TV shows the unlicensed watermark. Retry: sudo ./liveoverlay.sh license"
+  ensure_license || die "The license is not active — the box stays LOCKED (dashboard, phones, TV). Retry: sudo ./liveoverlay.sh license"
 }
 
 # Forgotten dashboard password: set a new one from the box itself (root on the mini-PC is the
@@ -534,14 +577,14 @@ cmd_registry() {
   ok "Apply it with: sudo ./liveoverlay.sh update"
 }
 
-# ── Admin actions through the api (kiosk token, demo config, password hash) ─
+# ── Admin actions through the api (kiosk token, password hash) ───────────────
 # Runs a tiny node program INSIDE the api container, fed on stdin; the password travels as an
 # environment variable taken from this process (`-e LO_PW` without a value), so it never
 # appears on any command line. Every session it opens is logged out again.
 api_admin() { # api_admin <action> → stdout; exit 3 = bad password
-  LO_ACTION="$1" docker exec -i -e LO_EMAIL -e LO_PW -e LO_ACTION -e LO_BODY liveoverlay-api node - <<'JS'
+  LO_ACTION="$1" docker exec -i -e LO_EMAIL -e LO_PW -e LO_ACTION liveoverlay-api node - <<'JS'
 const base = 'http://127.0.0.1:3000/api';
-const { LO_EMAIL: email, LO_PW: password, LO_ACTION: action, LO_BODY: body } = process.env;
+const { LO_EMAIL: email, LO_PW: password, LO_ACTION: action } = process.env;
 async function call(method, path, token, data) {
   const headers = { 'Content-Type': 'application/json' };
   if (token) headers.Authorization = 'Bearer ' + token;
@@ -559,9 +602,6 @@ async function call(method, path, token, data) {
     if (action === 'kiosk-url') {
       const d = await call('POST', '/auth/kiosk-tokens', token, { label: 'TV kiosk (installed ' + new Date().toISOString().slice(0, 10) + ')' });
       process.stdout.write('http://localhost/?token=' + encodeURIComponent(d.secret));
-    } else if (action === 'demo-config') {
-      await call('PUT', '/demo/config', token, JSON.parse(body));
-      process.stdout.write('ok');
     } else if (action === 'check') {
       process.stdout.write('ok');
     } else { throw new Error('unknown action ' + action); }
@@ -665,7 +705,7 @@ cmd_urls() {
 cmd_up() {
   need_docker; need_env
   guard_no_license_stack
-  migrate_env; ensure_timezone
+  migrate_env; retire_demo_hotspot; ensure_timezone
   prepare_dirs
   [ "$BUNDLE" = 0 ] || registry_mode || die "No image repository set (a bundle install can't build). Run: sudo ./liveoverlay.sh registry"
   if registry_mode; then
@@ -694,7 +734,7 @@ cmd_status() {
     active)  if [ -z "$ck" ] || [ "$ck" = ok ]; then ok "License: active ($(env_get LICENSE_SERVER_URL))"; else warn "License: active (cached) — last check failed: $(license_problem "$ck")"; fi ;;
     grace)   warn "License: grace period — $(license_problem "${ck:-unreachable}")" ;;
     "")      warn "License: unknown (api not reachable)" ;;
-    *)       warn "License: $lic — the TV shows the unlicensed watermark: $(license_problem "$ck"). Fix: sudo ./liveoverlay.sh license" ;;
+    *)       warn "License: $lic — the box is LOCKED: $(license_problem "$ck"). Fix: sudo ./liveoverlay.sh license" ;;
   esac
   if [ -f "$ROOT/backups/last-status" ]; then
     local r t; r="$(sed -n 's/^result=//p' "$ROOT/backups/last-status")"; t="$(sed -n 's/^time=//p' "$ROOT/backups/last-status")"
@@ -868,12 +908,12 @@ cmd_update() { # cmd_update [version]
   fi
   guard_no_license_stack
   # Releases from the licensing go-live on have no LICENSE_MODE=off: a box installed with it
-  # (or with no license URL) would show the unlicensed watermark after this update.
+  # (or with no license URL) would stay LOCKED after this update.
   local relicense=0
   if ! license_configured; then
     warn "Licensing is REQUIRED from this release on (the temporary LICENSE_MODE=off is gone)."
     if interactive; then prompt_license; relicense=1
-    else warn "No license server set — after the update the TV shows the watermark until: sudo ./liveoverlay.sh license"; fi
+    else warn "No license server set — after the update the box stays LOCKED until: sudo ./liveoverlay.sh license"; fi
   fi
   stack_ready || warn "The stack is not fully healthy BEFORE the update — a rollback would return to this state."
   record_release
@@ -897,7 +937,7 @@ cmd_update() { # cmd_update [version]
     git -C "$ROOT" pull --ff-only || die "git pull failed (local changes?). Nothing was changed."
     if registry_mode; then compose pull || die "docker pull failed. Nothing was restarted."; else compose build || die "Build failed. Nothing was restarted."; fi
   fi
-  migrate_env; ensure_timezone; prepare_dirs
+  migrate_env; retire_demo_hotspot; ensure_timezone; prepare_dirs
   compose up -d --no-build --pull never --remove-orphans || true
   if wait_healthy "$HEALTH_GATE_SECONDS"; then
     prune_old_releases
@@ -1019,35 +1059,12 @@ cmd_kiosk() {
   set_env KIOSK on
 }
 
-# ── Firewall / hardening / demo hotspot ─────────────────────────────────────
-cmd_firewall() { bash "$ROOT/scripts/firewall.sh" "${1:-apply}"; }
-cmd_harden()   { bash "$ROOT/scripts/host-hardening.sh" apply; }
-
-cmd_demo() {
-  need_env
-  local script="$ROOT/scripts/demo-hotspot.sh"
-  case "${1:-status}" in
-    up)
-      local out ssid pass gw body
-      out="$(bash "$script" up --print-env)" || die "Hotspot failed to start."
-      ssid="$(sed -n "s/^HOTSPOT_SSID='\(.*\)'$/\1/p" <<< "$out")"
-      pass="$(sed -n "s/^HOTSPOT_PASSPHRASE='\(.*\)'$/\1/p" <<< "$out")"
-      gw="$(sed -n "s/^HOTSPOT_GATEWAY='\(.*\)'$/\1/p" <<< "$out")"
-      echo; bold "Demo hotspot is up (isolated: no internet, no LAN, only the demo page)"
-      echo "  SSID       : $ssid"
-      echo "  Passphrase : $pass   ← new for this session"
-      echo "  Address    : http://$gw/demo/"
-      body="$(printf '{"wifiSsid":"%s","wifiPassword":"%s","publicHost":"%s"}' "$ssid" "$pass" "$gw")"
-      if admin_credentials && [ "$(LO_BODY="$body" api_admin demo-config 2>/dev/null)" = ok ]; then
-        ok "Saved to the dashboard's Demo Mode — print the card from there (its Wi-Fi QR is updated)."
-      else
-        warn "Enter these in the dashboard → Demo Mode (Wi-Fi name/password, address $gw), then print the card."
-      fi ;;
-    down) bash "$script" down ;;
-    status) bash "$script" status ;;
-    *) die "usage: sudo ./liveoverlay.sh demo up|down|status" ;;
-  esac
+# ── Firewall / hardening ────────────────────────────────────────────────────
+cmd_firewall() {
+  bash "$ROOT/scripts/firewall.sh" "${1:-apply}"
+  [ "${1:-apply}" != apply ] || retire_demo_hotspot
 }
+cmd_harden()   { bash "$ROOT/scripts/host-hardening.sh" apply; }
 
 # ── Install ─────────────────────────────────────────────────────────────────
 write_env() {
@@ -1171,7 +1188,6 @@ case "$cmd" in
   cameras) cmd_cameras ;;
   certs) cmd_certs "${1:-}" ;;
   firewall) cmd_firewall "${1:-apply}" ;;
-  demo) cmd_demo "${1:-status}" ;;
   harden) cmd_harden ;;
   timezone) cmd_timezone "${1:-}" ;;
   registry) cmd_registry "${1:-}" ;;
